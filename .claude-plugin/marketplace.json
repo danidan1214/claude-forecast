@@ -1,0 +1,6 @@
+{
+  "name": "claude-forecast",
+  "owner": { "name": "danidan1214" },
+  "plugins": [{ "name": "forecast-meter", "source": "./" }],
+  "description": "Claude Code meter that forecasts context and rate-limit exhaustion"
+}

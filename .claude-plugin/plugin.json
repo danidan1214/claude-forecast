@@ -1,0 +1,18 @@
+{
+  "name": "forecast-meter",
+  "version": "0.1.0",
+  "description": "One-line meter that forecasts when context and the 5-hour limit run out, counts down the prompt cache and prices each turn",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache TTL",
+      "description": "How long the prompt cache lives after the last response",
+      "default": "1h",
+      "options": ["5m", "1h"]
+    }
+  },
+  "author": { "name": "Daniel Palma" },
+  "repository": "https://github.com/danidan1214/claude-forecast",
+  "license": "MIT"
+}
