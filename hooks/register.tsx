@@ -21,6 +21,13 @@ export function duration(ms: number): string {
   return h < 24 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${Math.floor(h / 24)}d${h % 24}h`
 }
 
+// A clock time reads faster than a duration the person has to add to now.
+export function until(ts: number, now: number): string {
+  const d = new Date(ts)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return d.toDateString() === new Date(now).toDateString() ? hm : `${d.toLocaleDateString('en-US', { weekday: 'short' })} ${hm}`
+}
+
 export function compact(n: number): string {
   return n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(1)}k` : `${(n / 1_000_000).toFixed(1)}M`
 }
@@ -60,20 +67,109 @@ export function isExpensive(usd: number | undefined, history: number[]): boolean
   return usd > (2 * history.reduce((a, b) => a + b, 0)) / history.length
 }
 
-export function layout(columns: number) {
-  return { weekly: columns >= 110, resets: columns >= 110, repo: columns >= 90 }
+export function bar(p: number, width = 5): [string, string] {
+  const filled = Math.min(width, Math.max(0, Math.round((p / 100) * width)))
+  return ['━'.repeat(filled), '─'.repeat(width - filled)]
 }
 
 function pick(limits: SessionRateLimit[], kind: string) {
   return limits.find(l => l.kind === kind)
 }
 
-function pct(p?: number) {
-  return p === undefined ? '—' : `${Math.round(p)}%`
+function pct(p: number) {
+  return `${Math.round(p)}%`
 }
 
-function heat(p?: number) {
-  return p === undefined ? undefined : p >= 90 ? 'red' : p >= 70 ? 'yellow' : 'green'
+const ACCENT = '#D97757'
+const SEP = ' │ '
+const REPO_GAP = 2
+
+// Color only flags what needs attention; a calm value stays neutral.
+function heat(p: number) {
+  return p >= 90 ? 'red' : p >= 70 ? 'yellow' : undefined
+}
+
+export type Part = { text: string; color?: string; dim?: boolean; bold?: boolean }
+// Higher priority drops first; full gives way to lean before anything is hidden.
+export type Segment = { id: string; priority: number; full: Part[]; lean: Part[] }
+
+function gauge(label: string, p: number): { full: Part[]; lean: Part[] } {
+  const [filled, empty] = bar(p)
+  const value: Part = { text: pct(p), color: heat(p), bold: heat(p) === 'red' }
+  const head: Part = { text: `${label} `, dim: true }
+  return {
+    full: [head, { text: filled, color: heat(p) ?? ACCENT }, { text: `${empty} `, dim: true }, value],
+    lean: [head, value],
+  }
+}
+
+export function segments(m: Meter, now: number, ttlMs: number): Segment[] {
+  const out: Segment[] = []
+  if (m.context !== undefined) {
+    const g = gauge('ctx', m.context)
+    const turns = turnsLeft(m.ctxHistory, m.context)
+    const more: Part[] = m.context >= 50 && turns !== undefined ? [{ text: ` ~${turns} turns`, dim: true }] : []
+    out.push({ id: 'ctx', priority: 0, full: [...g.full, ...more], lean: [...g.lean, ...more] })
+  }
+  if (m.fiveHour !== undefined) {
+    const g = gauge('5h', m.fiveHour)
+    const eta = etaMs(m.fiveSamples, now)
+    const resetIn = m.fiveReset ? Date.parse(m.fiveReset) - now : undefined
+    const runsOut = eta !== undefined && resetIn !== undefined && eta < resetIn
+    const risk: Part[] = runsOut ? [{ text: ` out in ${duration(eta!)}`, color: 'red', bold: true }] : []
+    const reset: Part[] = resetIn !== undefined && (runsOut || m.fiveHour >= 70) ? [{ text: ` →${until(now + resetIn, now)}`, dim: true }] : []
+    out.push({ id: '5h', priority: 2, full: [...g.full, ...risk, ...reset], lean: [...g.lean, ...risk] })
+  }
+  if (m.weekly !== undefined) {
+    const g = gauge('wk', m.weekly)
+    const reset: Part[] = m.weeklyReset && m.weekly >= 70 ? [{ text: ` →${until(Date.parse(m.weeklyReset), now)}`, dim: true }] : []
+    out.push({ id: 'wk', priority: 4, full: [...g.full, ...reset], lean: g.lean })
+  }
+  if (m.lastResponseAt !== undefined) {
+    const left = ttlMs - (now - m.lastResponseAt)
+    // Under 80 % the turn re-paid most of its context: worth a glance.
+    const head: Part[] = [{ text: 'cache hit ', dim: true }, ...(m.hitRatio !== undefined ? [{ text: `${m.hitRatio}%`, color: m.hitRatio < 80 ? 'yellow' : undefined }] : [])]
+    const state: Part[] = m.busy ? [] : left <= 0 ? [{ text: ' · ', dim: true }, { text: 'cold', color: 'yellow' }] : left <= 5 * MIN ? [{ text: ' · ', dim: true }, { text: `${duration(left)} left`, color: left <= MIN ? 'red' : 'yellow' }] : []
+    out.push({ id: 'cache', priority: 3, full: [...head, ...state], lean: [...head, ...state] })
+  }
+  if (m.turnTokens !== undefined) {
+    const pricey = isExpensive(m.turnUsd, m.usdHistory.slice(0, -1))
+    const color = pricey ? 'yellow' : undefined
+    const usd: Part[] = m.turnUsd !== undefined ? [{ text: `$${m.turnUsd.toFixed(2)}`, color }] : [{ text: compact(m.turnTokens), color }]
+    const flag: Part[] = pricey ? [{ text: ' ▲', color }] : []
+    out.push({
+      id: 'turn',
+      priority: 5,
+      full: [{ text: 'turn ', dim: true }, { text: compact(m.turnTokens), color }, ...(m.turnUsd !== undefined ? [{ text: ' · ', dim: true }, usd[0]!] : []), ...flag],
+      lean: [{ text: 'turn ', dim: true }, ...usd, ...flag],
+    })
+  }
+  if (m.repo) {
+    const head: Part[] = [{ text: '⎇ ', color: ACCENT }, { text: m.repo }]
+    out.push({ id: 'repo', priority: 6, full: [...head, ...(m.branch ? [{ text: `:${m.branch}`, dim: true }] : [])], lean: head })
+  }
+  return out
+}
+
+export function width(parts: Part[]): number {
+  return parts.reduce((n, p) => n + [...p.text].length, 0)
+}
+
+export function fit(segs: Segment[], columns: number): { left: Part[][]; repo?: Part[] } {
+  const mode = new Map(segs.map(s => [s.id, s.full]))
+  const kept = new Set(segs.map(s => s.id))
+  const total = () => {
+    const live = segs.filter(s => kept.has(s.id))
+    const left = live.filter(s => s.id !== 'repo')
+    const repo = live.find(s => s.id === 'repo')
+    return left.reduce((n, s) => n + width(mode.get(s.id)!), 0) + SEP.length * Math.max(0, left.length - 1) + (repo ? REPO_GAP + width(mode.get('repo')!) : 0)
+  }
+  const order = [...segs].sort((a, b) => b.priority - a.priority)
+  for (const s of order) if (total() > columns) mode.set(s.id, s.lean)
+  for (const s of order) if (total() > columns && s.priority > 0) kept.delete(s.id)
+  const live = segs.filter(s => kept.has(s.id))
+  const repo = live.find(s => s.id === 'repo')
+  return { left: live.filter(s => s.id !== 'repo').map(s => mode.get(s.id)!), repo: repo && mode.get('repo') }
 }
 
 function push<T>(list: T[], x: T): T[] {
@@ -95,7 +191,8 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const ran = await next(e)
-    await refreshRepo($)
+    // A reload re-runs session.start; keep the repo the last edit pointed to.
+    if (!(await read($, meter)).repo) await refreshRepo($)
     $.clock.every(1000, async () => {
       await update($, tick, t => t + 1)
       const m = await read($, meter)
@@ -144,7 +241,7 @@ export const register: Register = (on, options) => {
       await update($, meter, m => ({
         ...m,
         busy: false,
-        turnTokens: u ? u.input_tokens + u.output_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens : undefined,
+        turnTokens: u ? u.input_tokens + u.output_tokens + u.cache_creation_input_tokens : undefined,
         hitRatio: u ? hitRatio(u) : m.hitRatio,
         turnUsd,
         usdHistory: turnUsd === undefined ? m.usdHistory : push(m.usdHistory, turnUsd),
@@ -181,47 +278,21 @@ export const register: Register = (on, options) => {
     const { Box, Text } = $.ui.resolve(e)
     await read($, tick)
     const m = await read($, meter)
-    const now = await $.clock.now()
-    const L = layout(e.props.bodyColumns ?? e.viewport?.columns ?? 120)
-
-    const turns = turnsLeft(m.ctxHistory, m.context)
-    const eta = etaMs(m.fiveSamples, now)
-    const resetIn = m.fiveReset ? Date.parse(m.fiveReset) - now : undefined
-    const runsOut = eta !== undefined && resetIn !== undefined && eta < resetIn
-    const cacheLeft = m.lastResponseAt === undefined ? undefined : ttlMs - (now - m.lastResponseAt)
+    const columns = e.props.bodyColumns ?? e.viewport?.columns ?? 120
+    const { left, repo } = fit(segments(m, await $.clock.now(), ttlMs), columns)
+    const draw = (parts: Part[]) => parts.map(p => <Text color={p.color} dimColor={p.dim} bold={p.bold}>{p.text}</Text>)
 
     return (
-      <Box gap={2}>
-        <Text>
-          ctx <Text color={heat(m.context)}>{pct(m.context)}</Text>
-          {turns !== undefined && <Text dimColor> ~{turns}t</Text>}
+      <Box justifyContent="space-between" width={columns}>
+        <Text wrap="truncate-end">
+          {left.map((parts, i) => (
+            <Text>
+              {i > 0 && <Text dimColor>{SEP}</Text>}
+              {draw(parts)}
+            </Text>
+          ))}
         </Text>
-        {m.fiveHour !== undefined && (
-          <Text>
-            5h <Text color={heat(m.fiveHour)}>{pct(m.fiveHour)}</Text>
-            {runsOut ? <Text color="red" bold> out ~{duration(eta!)}</Text> : eta !== undefined && <Text color="green"> ✓</Text>}
-            {L.resets && resetIn !== undefined && <Text dimColor> ↻{duration(resetIn)}</Text>}
-          </Text>
-        )}
-        {L.weekly && m.weekly !== undefined && (
-          <Text>
-            wk <Text color={heat(m.weekly)}>{pct(m.weekly)}</Text>
-            {L.resets && m.weeklyReset && <Text dimColor> ↻{duration(Date.parse(m.weeklyReset) - now)}</Text>}
-          </Text>
-        )}
-        {cacheLeft !== undefined && (
-          <Text>
-            cache {m.hitRatio !== undefined && <Text dimColor>{m.hitRatio}% </Text>}
-            {m.busy ? <Text color="green">warm</Text> : cacheLeft > 0 ? <Text color={cacheLeft <= MIN ? 'red' : cacheLeft <= 5 * MIN ? 'yellow' : 'green'}>⏳{duration(cacheLeft)}</Text> : <Text color="gray">cold</Text>}
-          </Text>
-        )}
-        {m.turnTokens !== undefined && (
-          <Text color={isExpensive(m.turnUsd, m.usdHistory.slice(0, -1)) ? 'yellow' : undefined} dimColor={!isExpensive(m.turnUsd, m.usdHistory.slice(0, -1))}>
-            last +{compact(m.turnTokens)}
-            {m.turnUsd !== undefined && ` $${m.turnUsd.toFixed(2)}`}
-          </Text>
-        )}
-        {L.repo && m.repo && <Text color="cyan">⎇ {m.repo}:{m.branch}</Text>}
+        {repo && <Text wrap="truncate-end">{draw(repo)}</Text>}
       </Box>
     )
   })
